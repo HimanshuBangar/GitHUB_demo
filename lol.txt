@@ -1,3 +1,164 @@
-git inityvfvuf
-hjih
-lo
+### Install dependencies
+##!pip install ultralytics opencv-python matplotlib torch torchvision pillow transformers streamlit
+
+import streamlit as st
+import cv2
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from ultralytics import YOLO
+from PIL import Image
+from transformers import BlipProcessor, BlipForConditionalGeneration
+
+# Load the YOLOv8 models
+coco_model_path = 'yolov8n.pt'
+knife_model_path = 'best.pt'  # Path to the knife detection model
+
+# Ensure models exist before loading
+if not os.path.exists(coco_model_path):
+    st.error(f"COCO model not found: {coco_model_path}")
+    coco_model = None
+else:
+    coco_model = YOLO(coco_model_path)
+
+if not os.path.exists(knife_model_path):
+    st.error(f"Knife detection model not found: {knife_model_path}")
+    knife_model = None
+else:
+    knife_model = YOLO(knife_model_path)
+
+# Load BLIP model for image captioning-based NLP
+processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+model_nlp = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+
+# Initialize session state for caption context
+if "caption" not in st.session_state:
+    st.session_state.caption = ""
+
+def detect_objects(image_path, model, conf_threshold=0.7):
+    """ Detect objects in an image using YOLOv8 with a confidence threshold """
+    if model is None:
+        return [], None
+    results = model(image_path)
+    detected_objects = []
+    for box in results[0].boxes:
+        if box.conf >= conf_threshold:
+            detected_objects.append(model.names[int(box.cls)])
+    return detected_objects, results[0].plot()
+
+def generate_response(user_input, detected_objects, image):
+    """ Generate a chatbot response using BLIP image captioning """
+    if image is None:
+        return "No image available for generating a response."
+
+    lower_input = user_input.lower()
+    if any(phrase in lower_input for phrase in ['describe', 'what is in the image', 'caption']):
+        inputs = processor(images=image, return_tensors="pt")
+        out = model_nlp.generate(**inputs)
+        caption = processor.decode(out[0], skip_special_tokens=True)
+        st.session_state.caption = caption
+        return caption
+
+    if any(word in lower_input for word in ['object', 'detect', 'see', 'found']):
+        return f"Detected objects: {', '.join(detected_objects)}."
+
+    # Use caption as context for further queries
+    inputs = processor(text=user_input, images=image, return_tensors="pt")
+    out = model_nlp.generate(**inputs)
+    follow_up = processor.decode(out[0], skip_special_tokens=True)
+    return follow_up
+
+# Streamlit UI
+st.set_page_config(page_title="AI Chatbot", layout="wide")
+st.markdown("""
+    <style>
+        .reportview-container {
+            font-family: Arial, sans-serif;
+        }
+        .stTextInput input {
+            border-radius: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+        }
+        .stButton>button {
+            border-radius: 20px;
+            padding: 10px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+        }
+        .stButton>button:hover {
+            background-color: #45a049;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("🔍 Conversational AI Object Detection")
+st.write("Upload an image or use real-time webcam to detect objects and ask questions!")
+
+option = st.radio("Choose Input Method:", ["Upload Image", "Use Webcam"])
+
+image = None
+image_path = "temp_image.jpg"
+
+# Clear old image on reload
+if os.path.exists(image_path):
+    os.remove(image_path)
+
+if option == "Upload Image":
+    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file)
+        image.save(image_path)
+        st.image(image, caption="📷 Uploaded Image", use_container_width=True)
+
+elif option == "Use Webcam":
+    stframe = st.empty()
+    run = st.checkbox("Start Webcam")
+    if run:
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            st.error("Unable to access the camera.")
+        else:
+            ret, frame = cap.read()
+            if ret:
+                cv2.imwrite(image_path, frame)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(frame)
+                st.image(frame, caption="📷 Captured Frame", use_container_width=True)
+            cap.release()
+
+if os.path.exists(image_path):
+    detected_objects_coco, annotated_image_coco = detect_objects(image_path, coco_model, conf_threshold=0.7)
+    detected_objects_knife, annotated_image_knife = detect_objects(image_path, knife_model, conf_threshold=0.7)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if annotated_image_coco is not None:
+            st.image(annotated_image_coco, caption="🛠 Detected Objects (COCO)", use_container_width=True)
+    with col2:
+        if annotated_image_knife is not None:
+            st.image(annotated_image_knife, caption="⚠️ Knife Detection", use_container_width=True)
+
+    #st.markdown("### **Detected Objects:**")
+    #st.write("**COCO Model:**", detected_objects_coco if detected_objects_coco else "None")
+    #st.write("**Knife Detection Model:**", detected_objects_knife if detected_objects_knife else "None")
+
+    knife_confidence_threshold = 0.7
+    knife_detected = False
+    for result in knife_model(image_path):
+        for box in result.boxes:
+            if knife_model.names[int(box.cls)] == "knife" and box.conf >= knife_confidence_threshold:
+                knife_detected = True
+                break
+
+    if knife_detected:
+        st.error("🚨🚨 **HIGH ALERT: A knife has been detected in the image with high confidence!**")
+    elif any('knife' in obj.lower() for obj in detected_objects_knife):
+        st.warning("⚠️ **Possible knife detected, but confidence is below threshold.**")
+
+    user_input = st.text_input("💬 Ask about the image:")
+    if user_input:
+        response = generate_response(user_input, detected_objects_coco + detected_objects_knife, image)
+        st.write("**🤖 Chatbot:**", response)
